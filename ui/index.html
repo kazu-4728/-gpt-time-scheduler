@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<title>加工時間計算シミュレーター v1.2</title>
+<style>
+    body { font-family: 'メイリオ', sans-serif; background: #f9f9f9; padding: 1em; font-size: 13px; }
+    h2 { margin-top: 0 }
+    .control-row { display: flex; gap: 1em; flex-wrap: wrap; align-items: center; margin-bottom: .8em }
+    .product-block { background: #fff; border: 1px solid #ccc; border-radius: 4px; padding: .5em; margin-bottom: 1.2em }
+    .product-header { display: flex; gap: 1em; flex-wrap: wrap; align-items: center; margin-bottom: .4em }
+    .product-header input[type=number] { width: 60px; text-align: right }
+    .product-header input[type=text] { width: 120px }
+    .product-header input[type=date] { width: 130px }
+    .counter-wrap { display: inline-flex; align-items: center }
+    .counter-btn { display: none; padding: 0 5px; background: #eee; border: 1px solid #ccc; border-radius: 2px; margin: 0 2px; font-size: 14px; cursor: pointer }
+    @media(pointer:fine){ .counter-btn { display:inline-block } input.compact { width: 45px } }
+    .product-table { width: 100%; border-collapse: collapse }
+    .product-table th, .product-table td { border: 1px solid #ddd; padding: 4px 2px; text-align: center; font-size: 12px }
+    .product-table th { background: #f4f4f4 }
+    .product-table input[type=text], .product-table input[type=number] { width: 90%; font-size: 12px; padding: 2px 4px }
+    .btn { padding: 2px 9px; font-size: 12px; cursor: pointer; border: none; border-radius: 3px }
+    .btn-blue { background: #0078d4; color: #fff }
+    .btn-red { background: #c00; color: #fff }
+    .btn-gray { background: #666; color: #fff }
+    .canvas-area { margin-top: 1em; padding: 1em; background: #fff; border: 1px solid #ccc }
+    @media(max-width:700px){
+      .product-header { flex-direction: column; align-items: stretch; gap: .4em }
+      .product-header input, .product-header label { width: 100%!important }
+      .product-table { overflow-x: auto; display: block }
+    }
+  </style>
+</head>
+<body>
+<h2>加工時間計算シミュレーター v1.2</h2>
+<div class="control-row">
+<label>開始日 <input id="startDate" type="date"/></label>
+<label>終了日 <input id="endDate" type="date"/></label>
+<label>日中(h) <input class="compact" id="dayTime" step="0.5" type="number" value="10"/></label>
+<label>夜間(h) <input class="compact" id="nightTime" step="0.5" type="number" value="14"/></label>
+</div>
+<div id="productContainer"></div>
+<div class="control-row">
+<button class="btn btn-blue" onclick="addProductBlock()">製品を追加</button>
+<button class="btn btn-gray" onclick="calculateSchedule()">計算</button>
+<button class="btn btn-blue" onclick="exportJSON()">保存(JSON)</button>
+<button class="btn btn-blue" onclick="importJSON()">読み込み</button>
+<button class="btn btn-red" onclick="resetAll()">リセット</button>
+<input accept="application/json" id="jsonFile" style="display:none" type="file"/>
+</div>
+<div class="control-row" style="justify-content: flex-end">
+<button class="btn btn-gray" onclick="undoLastAction()">← 戻る（直前の計算状態に復元）</button>
+</div>
+<script>
+// ✅ Undo管理
+let undoStack = [];
+function saveUndo() {
+  const data = exportDataJSON();
+  if (!undoStack.length || undoStack[undoStack.length - 1] !== data) undoStack.push(data);
+  if (undoStack.length > 10) undoStack.shift();
+}
+function undoLastAction() {
+  if (undoStack.length > 0) buildFromJSON(undoStack.pop());
+  else alert('戻す履歴がありません');
+}
+
+// ✅ DOM取得
+const KEY = 'kakouDataV5';
+const container = document.getElementById('productContainer');
+const startDate = document.getElementById('startDate');
+const endDate = document.getElementById('endDate');
+const dayTime = document.getElementById('dayTime');
+const nightTime = document.getElementById('nightTime');
+const jsonFile = document.getElementById('jsonFile');
+const outputCanvas = document.getElementById('outputCanvas');
+
+// ✅ UI関数群
+function chg(btn, delta) {
+  const inp = btn.parentNode.querySelector('input');
+  inp.value = Math.max(0, ((parseFloat(inp.value) || 0) + delta).toFixed(1));
+  inp.dispatchEvent(new Event('input', { bubbles: true }));
+}
+function stepHTML(ph) {
+  return `<tr><td><input type="text" class="step" placeholder="${ph}"></td><td><span class="counter-wrap"><button class="counter-btn" onclick="chg(this,-0.1)">−</button><input type="number" step="0.1" class="step-time compact" placeholder="1.0"><button class="counter-btn" onclick="chg(this,0.1)">＋</button></span></td><td><span class="counter-wrap"><button class="counter-btn" onclick="chg(this,-1)">−</button><input type="number" class="step-remain compact" placeholder="auto"><button class="counter-btn" onclick="chg(this,1)">＋</button></span></td><td><input type="number" class="step-priority compact" placeholder=""></td><td><input type="number" class="step-prioqty compact" placeholder=""></td><td><button class="btn btn-red btn-sm" onclick="this.closest('tr').remove();refreshProdRemain(this)">削除</button></td></tr>`;
+}
+function addProductBlock(data) {
+  const div = document.createElement('div');
+  div.className = 'product-block';
+  div.innerHTML = `
+<div class="product-header">
+  <label>製品名 <input type="text" class="prod-name" placeholder="例：A001"></label>
+  <label>個数 <span class="counter-wrap">
+    <button class="counter-btn" onclick="chg(this,-1)">−</button>
+    <input type="number" class="prod-qty compact" placeholder="0" oninput="syncRem(this)">
+    <button class="counter-btn" onclick="chg(this,1)">＋</button>
+  </span></label>
+  <label>残数 <input type="number" class="prod-remain compact" readonly></label>
+  <label>終了期限 <input type="date" class="prod-deadline"></label><label>必要日量数 <input type="number" class="prod-reqdays compact" placeholder="例：3"></label>
+  <button class="btn btn-red btn-sm" onclick="this.closest('.product-block').remove()">製品削除</button>
+</div>
+<div style="overflow-x:auto">
+  <table class="product-table">
+    <thead><tr><th>工程</th><th>時間</th><th>残数</th><th>優先</th><th>優先数</th><th>操作</th></tr></thead>
+    <tbody>${stepHTML('01')}</tbody>
+  </table>
+</div>
+<button class="btn btn-blue btn-sm" onclick="addStepRow(this)">工程追加</button>
+`;
+  container.appendChild(div);
+  if (data) fillProduct(div, data); else syncRem(div.querySelector('.prod-qty'));
+}
+function addStepRow(btn, data) {
+  const tbody = btn.parentNode.querySelector('tbody');
+  tbody.insertAdjacentHTML('beforeend', stepHTML(''));
+  if (data) fillStep(tbody.lastElementChild, data);
+}
+function syncRem(input) {
+  const qty = parseInt(input.value) || 0;
+  const block = input.closest('.product-block');
+  block.querySelector('.prod-remain').value = qty;
+  block.querySelectorAll('.step-remain').forEach(e => {
+    if (!e.dataset.user || e.dataset.auto === 'true') {
+      e.value = qty;
+      e.dataset.auto = 'true';
+    }
+  });
+  saveLocal();
+}
+function refreshProdRemain(btn) {
+  const block = btn.closest('.product-block');
+  const last = block.querySelector('tbody tr:last-child .step-remain');
+  block.querySelector('.prod-remain').value = last.value;
+  saveLocal();
+}
+document.addEventListener('input', e => {
+  if (e.target.classList.contains('step-remain')) {
+    e.target.dataset.user = 'true';
+    e.target.dataset.auto = 'false';
+  }
+});
+
+// ✅ JSON入出力
+function exportDataJSON() {
+  const data = {
+    start: startDate.value,
+    end: endDate.value,
+    day: dayTime.value,
+    night: nightTime.value,
+    products: [...document.querySelectorAll('.product-block')].map(pb => ({
+      name: pb.querySelector('.prod-name').value,
+      qty: pb.querySelector('.prod-qty').value,
+      remain: pb.querySelector('.prod-remain').value,
+      deadline: pb.querySelector('.prod-deadline').value,
+      steps: [...pb.querySelectorAll('tbody tr')].map(tr => ({
+        step: tr.querySelector('.step').value,
+        time: tr.querySelector('.step-time').value,
+        remain: tr.querySelector('.step-remain').value,
+        priority: tr.querySelector('.step-priority').value,
+        prioqty: tr.querySelector('.step-prioqty').value
+      }))
+    }))
+  };
+  return JSON.stringify(data);
+}
+function exportJSON() {
+  const blob = new Blob([exportDataJSON()], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'kakou_data.json';
+  a.click();
+}
+function importJSON() { jsonFile.click(); }
+jsonFile.onchange = e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const fr = new FileReader();
+  fr.onload = ev => buildFromJSON(ev.target.result);
+  fr.readAsText(file);
+};
+function buildFromJSON(txt) {
+  try {
+    const d = JSON.parse(txt);
+    startDate.value = d.start || '';
+    endDate.value = d.end || '';
+    dayTime.value = d.day || 10;
+    nightTime.value = d.night || 14;
+    container.innerHTML = '';
+    (d.products || []).forEach(p => { addProductBlock(); fillProduct(container.lastElementChild, p); });
+    saveLocal();
+  } catch (e) { alert('JSON 読込失敗'); }
+}
+function fillProduct(div, p) {
+  div.querySelector('.prod-name').value = p.name || '';
+  div.querySelector('.prod-qty').value = p.qty || 0;
+  div.querySelector('.prod-remain').value = p.remain || p.qty || 0;
+  div.querySelector('.prod-deadline').value = p.deadline || '';
+  const tbody = div.querySelector('tbody');
+  tbody.innerHTML = '';
+  (p.steps || []).forEach(st => addStepRow({ parentNode: { querySelector: sel => tbody } }, st));
+  syncRem(div.querySelector('.prod-qty'));
+}
+function fillStep(tr, data) {
+  tr.querySelector('.step').value = data.step || '';
+  tr.querySelector('.step-time').value = data.time || '';
+  tr.querySelector('.step-remain').value = data.remain || '';
+  tr.querySelector('.step-priority').value = data.priority || '';
+  tr.querySelector('.step-prioqty').value = data.prioqty || '';
+}
+function saveLocal() { localStorage.setItem(KEY, exportDataJSON()); }
+function loadLocal() { const j = localStorage.getItem(KEY); if (j) buildFromJSON(j); }
+function resetAll() { if (confirm('全データを削除しますか?')) { localStorage.removeItem(KEY); location.reload(); } }
+function daysLeft(p, date) { return p.deadline ? Math.ceil((p.deadline - date) / 86400000) : 9999; }
+
+// ✅ 計算とCanvas出力
+function calculateSchedule() {
+  saveUndo();
+  const s = startDate.value, e = endDate.value;
+  if (!s || !e) return alert('期間設定必須');
+  const dayCap = parseFloat(dayTime.value) || 0, nightCap = parseFloat(nightTime.value) || 0;
+  let dates = [];
+  for (let d = new Date(s); d <= new Date(e); d.setDate(d.getDate() + 1)) dates.push(new Date(d));
+
+  let prods = [...document.querySelectorAll('.product-block')].map(pb => {
+    const steps = [...pb.querySelectorAll('tbody tr')].map(tr => {
+      return {
+        step: tr.querySelector('.step').value,
+        time: parseFloat(tr.querySelector('.step-time').value) || 0.1,
+        remain: parseInt(tr.querySelector('.step-remain').value),
+        dom: tr.querySelector('.step-remain'),
+        priority: parseInt(tr.querySelector('.step-priority').value) || 9999
+      };
+    });
+    return {
+      name: pb.querySelector('.prod-name').value || '製品',
+      deadline: pb.querySelector('.prod-deadline').value ? new Date(pb.querySelector('.prod-deadline').value) : null,
+      prodRemInp: pb.querySelector('.prod-remain'),
+      steps
+    };
+  });
+
+  // 未入力残数の自動設定
+  prods.forEach(p => {
+    p.steps.forEach((s, i) => {
+      if (isNaN(s.remain) || s.remain === 0) {
+        const src = i === 0 ? parseInt(p.prodRemInp.value) : parseInt(p.steps[i - 1].dom.value);
+        if (!s.dom.dataset.user) {
+          s.remain = src || 0;
+          s.dom.value = s.remain;
+          s.dom.dataset.auto = 'true';
+        }
+      }
+    });
+  });
+
+  let canvasData = [], total = 0;
+  dates.forEach(date => {
+    let dayR = dayCap, nightR = nightCap, pallet = 0, dayL = [], nightL = [], dH = 0, nH = 0;
+    const process = mode => {
+      let cap = mode === 'day' ? dayR : nightR;
+      while (cap > 0 && (mode !== 'night' || pallet < 6)) {
+        let cands = [];
+        prods.forEach(p => {
+          const idx = p.steps.findIndex((s, i) => s.remain > 0 && (i === 0 || p.steps[i - 1].remain === 0));
+          if (idx > -1) {
+            let s = p.steps[idx];
+            if (!p.deadline || date <= p.deadline) cands.push({ p, s, idx });
+          }
+        });
+        if (!cands.length) break;
+        cands.sort((a, b) => {
+          const da = daysLeft(a.p, date), db = daysLeft(b.p, date);
+          if (da !== db) return da - db;
+          if (a.s.priority !== b.s.priority) return a.s.priority - b.s.priority;
+          return mode === 'day' ? a.s.time - b.s.time : b.s.time - a.s.time;
+        });
+        const sel = cands[0];
+        const maxBatch = Math.min(sel.s.remain, Math.floor(cap / sel.s.time));
+        if (maxBatch <= 0) break;
+        const usedTime = maxBatch * sel.s.time;
+        const log = `${sel.p.name} ${sel.s.step} ${maxBatch}個 ${usedTime.toFixed(1)}h`;
+        if (mode === 'day') { dayL.push(log); dH += usedTime; dayR -= usedTime; } else { nightL.push(log); nH += usedTime; nightR -= usedTime; pallet++; }
+        sel.s.remain -= maxBatch;
+        sel.s.dom.value = sel.s.remain;
+        sel.p.prodRemInp.value = sel.s.remain;
+        cap = mode === 'day' ? dayR : nightR;
+      }
+    };
+    process('day');
+    process('night');
+    canvasData.push({ date, dayL, nightL, sum: (dH + nH).toFixed(1) });
+    total += dH + nH;
+  });
+  window.canvasData = canvasData;
+console.log('canvasData:', canvasData);
+window.canvasData = canvasData;
+drawTextResults(window.canvasData);
+  saveLocal();
+}
+function draw(arr, total) {
+  const c = outputCanvas, ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+  ctx.font = "13px 'メイリオ'";
+  let y = 20;
+  c.height = Math.max(650, arr.length * 90);
+  arr.forEach(d => {
+    ctx.fillStyle = '#0078d4'; ctx.fillText(`${d.date.getFullYear()}/${d.date.getMonth() + 1}/${d.date.getDate()}`, 20, y); y += 16;
+    ctx.fillStyle = '#444'; ctx.fillText('昼:', 40, y); y += 16;
+    (d.dayL.length ? d.dayL : ['なし']).forEach(l => { ctx.fillStyle = '#222'; ctx.fillText(l, 60, y); y += 16 });
+    ctx.fillStyle = '#666'; ctx.fillText('夜:', 40, y); y += 16;
+    (d.nightL.length ? d.nightL : ['なし']).forEach(l => { ctx.fillStyle = '#000'; ctx.fillText(l, 60, y); y += 16 });
+    ctx.fillStyle = '#c00'; ctx.fillText(`日計 ${d.sum}h`, 40, y); y += 24;
+  });
+  ctx.fillStyle = '#c00'; ctx.fillText(`総時間 ${total}h`, 20, y);
+}
+window.onload = () => {
+  const t = new Date().toISOString().split('T')[0];
+  startDate.value = t;
+  endDate.value = t;
+  loadLocal();
+  if (!container.childElementCount) addProductBlock();
+};
+
+function draw(arr, total) {
+  const c = outputCanvas, ctx = c.getContext('2d');
+
+  const dayWidth = 260;
+  const fontSize = 16;
+  const marginLeft = 20;
+  const marginTop = 20;
+  const padding = 10;
+
+  ctx.font = `${fontSize}px 'Yu Gothic UI', sans-serif`;
+  ctx.textBaseline = 'top';
+
+  const daysPerRow = Math.min(arr.length, 7);
+  const rows = Math.ceil(arr.length / daysPerRow);
+
+  let rowHeights = [];
+  for (let i = 0; i < arr.length; i++) {
+    const d = arr[i];
+    const dayLines = (d.dayL.length || 1) + 1;
+    const nightLines = (d.nightL.length || 1) + 1;
+    const totalLines = 1 + 1 + dayLines + 1 + nightLines + 3;
+    rowHeights.push(totalLines * (fontSize + 2) + padding * 2);
+  }
+
+  const rowBlockHeights = [];
+  for (let r = 0; r < rows; r++) {
+    const maxH = Math.max(...rowHeights.slice(r * daysPerRow, (r + 1) * daysPerRow));
+    rowBlockHeights.push(maxH);
+  }
+
+  const canvasHeight = rowBlockHeights.reduce((a, b) => a + b, 0) + marginTop * 2 + 40;
+  const canvasWidth = dayWidth * daysPerRow + marginLeft * 2;
+
+  c.width = canvasWidth;
+  c.height = canvasHeight;
+
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+
+  arr.forEach((d, i) => {
+    const col = i % daysPerRow;
+    const row = Math.floor(i / daysPerRow);
+    const x0 = marginLeft + col * dayWidth;
+    const y0 = marginTop + rowBlockHeights.slice(0, row).reduce((a, b) => a + b, 0);
+
+    const blockHeight = rowHeights[i];
+
+    ctx.fillStyle = '#f4f4f4';
+    ctx.fillRect(x0, y0, dayWidth - 10, blockHeight);
+    ctx.strokeStyle = '#999';
+    ctx.strokeRect(x0, y0, dayWidth - 10, blockHeight);
+
+    let x = x0 + padding;
+    let y = y0 + padding;
+
+    ctx.fillStyle = '#0078d4';
+    ctx.fillText(`${d.date.getFullYear()}/${d.date.getMonth() + 1}/${d.date.getDate()}`, x, y);
+    y += fontSize + 4;
+
+    ctx.fillStyle = '#444';
+    ctx.fillText('昼:', x, y);
+    y += fontSize + 2;
+    let dH = 0;
+    (d.dayL.length ? d.dayL : ['なし']).forEach(l => {
+      ctx.fillStyle = '#222';
+      const label = l.replace(/^([A-Z0-9]+) ([^ ]+)/, '$1 $2工程');
+      ctx.fillText(label, x + 10, y);
+      const h = parseFloat(label.match(/([\d.]+)h$/)?.[1]) || 0;
+      dH += h;
+      y += fontSize + 2;
+    });
+    ctx.fillStyle = '#06c';
+    ctx.fillText(`昼 合計：${dH.toFixed(1)}時間`, x + 10, y);
+    y += fontSize + 6;
+
+    ctx.fillStyle = '#444';
+    ctx.fillText('夜:', x, y);
+    y += fontSize + 2;
+    let nH = 0;
+    (d.nightL.length ? d.nightL : ['なし']).forEach(l => {
+      ctx.fillStyle = '#000';
+      const label = l.replace(/^([A-Z0-9]+) ([^ ]+)/, '$1 $2工程');
+      ctx.fillText(label, x + 10, y);
+      const h = parseFloat(label.match(/([\d.]+)h$/)?.[1]) || 0;
+      nH += h;
+      y += fontSize + 2;
+    });
+    ctx.fillStyle = '#06c';
+    ctx.fillText(`夜 合計：${nH.toFixed(1)}時間`, x + 10, y);
+    y += fontSize + 6;
+
+    const totalH = dH + nH;
+    ctx.fillStyle = '#c00';
+    ctx.fillText(`1日 総合計：${totalH.toFixed(1)}時間`, x, y);
+  });
+
+  ctx.fillStyle = '#c00';
+  ctx.fillText(`総時間 ${total}時間`, marginLeft, canvasHeight - fontSize - 8);
+}
+
+
+function drawTextResults(arr) {
+  console.log('drawTextResults received:', arr);
+  let resultArea = document.getElementById("textResultArea");
+  resultArea.innerHTML = "";
+  let totalAll = 0;
+
+  arr.forEach((d) => {
+    let dH = 0, nH = 0;
+    const box = document.createElement("div");
+    box.style.cssText = "background:#fff;border:1px solid #ccc;border-radius:6px;padding:10px;width:230px;margin:10px;display:inline-block;font-family:'Segoe UI',sans-serif;font-size:14px;vertical-align:top;";
+
+    const head = document.createElement("div");
+    head.style.color = "#0078d4";
+    head.style.fontWeight = "bold";
+    head.innerText = `${d.date.getFullYear()}/${d.date.getMonth()+1}/${d.date.getDate()}`;
+    box.appendChild(head);
+
+    const day = document.createElement("div");
+    day.innerHTML = "<strong>昼:</strong><br>" + (d.dayL.length ? d.dayL.map(l => {
+      const label = l.replace(/^([A-Z0-9]+) ([^ ]+) (\d+)個 ([\d\.]+h)/, "$1 $2工程 $3個 $4");
+      const match = label.match(/([\d\.]+)h$/);
+      if (match) dH += parseFloat(match[1]);
+      return label;
+    }).join("<br>") : "なし");
+    box.appendChild(day);
+
+    const dtotal = document.createElement("div");
+    dtotal.style.color = "#06c";
+    dtotal.innerText = `昼 合計：${dH.toFixed(1)}時間`;
+    box.appendChild(dtotal);
+
+    const night = document.createElement("div");
+    night.innerHTML = "<br><strong>夜:</strong><br>" + (d.nightL.length ? d.nightL.map(l => {
+      const label = l.replace(/^([A-Z0-9]+) ([^ ]+) (\d+)個 ([\d\.]+h)/, "$1 $2工程 $3個 $4");
+      const match = label.match(/([\d\.]+)h$/);
+      if (match) nH += parseFloat(match[1]);
+      return label;
+    }).join("<br>") : "なし");
+    box.appendChild(night);
+
+    const ntotal = document.createElement("div");
+    ntotal.style.color = "#06c";
+    ntotal.innerText = `夜 合計：${nH.toFixed(1)}時間`;
+    box.appendChild(ntotal);
+
+    const total = document.createElement("div");
+    total.style.color = "#c00";
+    total.style.fontWeight = "bold";
+    total.innerText = `1日 総合計：${(dH+nH).toFixed(1)}時間`;
+    box.appendChild(total);
+
+    totalAll += dH + nH;
+    resultArea.appendChild(box);
+  });
+
+  const sum = document.createElement("div");
+  sum.style.cssText = "margin-top:20px;color:#c00;font-weight:bold;";
+  sum.innerText = `総時間：${totalAll.toFixed(1)}時間`;
+  resultArea.appendChild(sum);
+}
+
+
+function exportCSV() {
+  if (!window.canvasData || !Array.isArray(window.canvasData)) {
+    alert("計算結果がありません");
+    return;
+  }
+
+  let lines = ["日付,時間帯,製品,工程,個数,時間"];
+  window.canvasData.forEach(d => {
+    const date = `${d.date.getFullYear()}/${d.date.getMonth()+1}/${d.date.getDate()}`;
+    d.dayL.forEach(line => {
+      const m = line.match(/^([A-Z0-9]+) ([^ ]+) (\d+)個 ([\d\.]+)h$/);
+      if (m) lines.push(`${date},昼,${m[1]},${m[2]},${m[3]},${m[4]}`);
+    });
+    d.nightL.forEach(line => {
+      const m = line.match(/^([A-Z0-9]+) ([^ ]+) (\d+)個 ([\d\.]+)h$/);
+      if (m) lines.push(`${date},夜,${m[1]},${m[2]},${m[3]},${m[4]}`);
+    });
+  });
+
+  const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "加工時間結果.csv";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+
+// ✅ 日量数ロジック統合
+function isProductComplete(p) {
+  const requiredQty = parseInt(p.prodQtyInp?.value || 0);
+  const finalStep = p.steps[p.steps.length - 1];
+  const finishedQty = requiredQty - (parseInt(finalStep?.remain) || 0);
+  return finishedQty >= (parseInt(p.dailyTarget?.value || 0));
+}
+</script>
+<button onclick="exportCSV()" style="margin:10px;padding:6px 12px;font-size:14px;">CSV出力</button>
+<div id="textResultArea" style="margin:20px;"></div>
+</body>
+</html>
