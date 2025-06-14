@@ -1,0 +1,8 @@
+{
+  "products": [
+    { "name": "A", "processes": [2.5, 1.5], "due": "2025-06-15" },
+    { "name": "B", "processes": [1.0], "due": "2025-06-14" }
+  ],
+  "start_date": "2025-06-13",
+  "work_time": 8
+}
